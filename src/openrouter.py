@@ -1,4 +1,6 @@
 import base64
+import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -6,10 +8,12 @@ from typing import Any
 import httpx
 
 from .config import Settings
+from .logging_utils import safe_headers, safe_json
 from .schemas import ImageGenerationRequest, JsonObject
 
 
 DATA_URL_RE = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<data>.+)$", re.DOTALL)
+logger = logging.getLogger("openrouter_image_gateway.openrouter")
 
 
 @dataclass
@@ -126,7 +130,7 @@ def build_openrouter_payload(request: ImageGenerationRequest, settings: Settings
         "model": request.model,
         "messages": [{"role": "user", "content": request.prompt}],
         "modalities": settings.openrouter_modalities,
-        "stream": False,
+        "stream": settings.openrouter_stream,
     }
 
     image_config = build_image_config(request)
@@ -139,22 +143,31 @@ def build_openrouter_payload(request: ImageGenerationRequest, settings: Settings
 def extract_images(payload: JsonObject) -> list[GeneratedImage]:
     images: list[GeneratedImage] = []
     for choice in payload.get("choices", []):
-        message = choice.get("message", {})
-        revised_prompt = _message_text(message)
+        for message in _choice_image_containers(choice):
+            revised_prompt = _message_text(message)
 
-        for item in message.get("images", []) or []:
-            url = _extract_image_url(item)
-            if url:
-                images.append(GeneratedImage(data_url=url, revised_prompt=revised_prompt))
+            for item in message.get("images", []) or []:
+                url = _extract_image_url(item)
+                if url:
+                    images.append(GeneratedImage(data_url=url, revised_prompt=revised_prompt))
 
-        # Some OpenAI-compatible providers expose generated images inside a
-        # content array instead of the OpenRouter-specific message.images field.
-        for item in message.get("content", []) if isinstance(message.get("content"), list) else []:
-            url = _extract_image_url(item)
-            if url:
-                images.append(GeneratedImage(data_url=url, revised_prompt=revised_prompt))
+            # Some OpenAI-compatible providers expose generated images inside a
+            # content array instead of the OpenRouter-specific message.images field.
+            for item in message.get("content", []) if isinstance(message.get("content"), list) else []:
+                url = _extract_image_url(item)
+                if url:
+                    images.append(GeneratedImage(data_url=url, revised_prompt=revised_prompt))
 
     return images
+
+
+def _choice_image_containers(choice: JsonObject) -> list[JsonObject]:
+    containers: list[JsonObject] = []
+    for key in ("message", "delta"):
+        value = choice.get(key)
+        if isinstance(value, dict):
+            containers.append(value)
+    return containers
 
 
 def _extract_image_url(item: Any) -> str | None:
@@ -208,16 +221,19 @@ class OpenRouterClient:
             # relying on provider-specific multi-image behavior.
             for _ in range(requested_count):
                 payload = build_openrouter_payload(request, self.settings)
-                response = await client.post(endpoint, headers=headers, json=payload)
-                if response.status_code >= 400:
-                    raise OpenRouterError(
-                        "OpenRouter request failed",
-                        status_code=response.status_code,
-                        details=_safe_response_payload(response),
-                    )
+                logger.debug(
+                    "Sending OpenRouter image request: endpoint=%s request_index=%s requested_count=%s headers=%s payload=%s",
+                    endpoint,
+                    len(generated) + 1,
+                    requested_count,
+                    json.dumps(safe_headers(headers, self.settings), ensure_ascii=False),
+                    json.dumps(safe_json(payload, self.settings), ensure_ascii=False),
+                )
 
-                response_payload = response.json()
-                generated.extend(extract_images(response_payload))
+                if self.settings.openrouter_stream:
+                    generated.extend(await self._post_streaming_image_request(client, endpoint, headers, payload))
+                else:
+                    generated.extend(await self._post_image_request(client, endpoint, headers, payload))
                 if len(generated) >= requested_count:
                     break
 
@@ -225,6 +241,144 @@ class OpenRouterClient:
             raise OpenRouterError("OpenRouter response did not contain generated images", status_code=502)
 
         return generated[:requested_count]
+
+    async def _post_image_request(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: str,
+        headers: dict[str, str],
+        payload: JsonObject,
+    ) -> list[GeneratedImage]:
+        try:
+            response = await client.post(endpoint, headers=headers, json=payload)
+        except httpx.TimeoutException as exc:
+            logger.exception(
+                "OpenRouter image request timed out: endpoint=%s timeout_seconds=%s",
+                endpoint,
+                self.settings.openrouter_timeout_seconds,
+            )
+            raise OpenRouterError(
+                "OpenRouter request timed out while waiting for image generation",
+                status_code=504,
+                details={"timeout_seconds": self.settings.openrouter_timeout_seconds},
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.exception(
+                "OpenRouter image request failed before receiving a response: endpoint=%s",
+                endpoint,
+            )
+            raise OpenRouterError(
+                "OpenRouter request failed before receiving a response",
+                status_code=502,
+                details=str(exc),
+            ) from exc
+
+        response_payload = _safe_response_payload(response)
+        logger.debug(
+            "Received OpenRouter image response: status_code=%s response=%s",
+            response.status_code,
+            json.dumps(safe_json(response_payload, self.settings), ensure_ascii=False),
+        )
+        if response.status_code >= 400:
+            logger.warning(
+                "OpenRouter returned an error response: status_code=%s response=%s",
+                response.status_code,
+                json.dumps(safe_json(response_payload, self.settings), ensure_ascii=False),
+            )
+            raise OpenRouterError(
+                "OpenRouter request failed",
+                status_code=response.status_code,
+                details=response_payload,
+            )
+
+        if not isinstance(response_payload, dict):
+            raise OpenRouterError(
+                "OpenRouter response was not a JSON object",
+                status_code=502,
+                details=response_payload,
+            )
+
+        return extract_images(response_payload)
+
+    async def _post_streaming_image_request(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: str,
+        headers: dict[str, str],
+        payload: JsonObject,
+    ) -> list[GeneratedImage]:
+        """Read OpenRouter SSE chunks and collect image outputs.
+
+        The public endpoint still returns one OpenAI Images JSON response. This
+        mode only changes the upstream call to OpenRouter, which can be useful
+        for providers that emit image chunks through Chat Completions streaming.
+        """
+
+        images: list[GeneratedImage] = []
+        try:
+            async with client.stream("POST", endpoint, headers=headers, json=payload) as response:
+                if response.status_code >= 400:
+                    response_body = await response.aread()
+                    response_payload = _parse_response_bytes(response_body)
+                    logger.warning(
+                        "OpenRouter returned a streaming error response: status_code=%s response=%s",
+                        response.status_code,
+                        json.dumps(safe_json(response_payload, self.settings), ensure_ascii=False),
+                    )
+                    raise OpenRouterError(
+                        "OpenRouter streaming request failed",
+                        status_code=response.status_code,
+                        details=response_payload,
+                    )
+
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    if not line.startswith("data:"):
+                        logger.debug("Skipping non-data OpenRouter stream line: line=%s", line)
+                        continue
+
+                    data = line.removeprefix("data:").strip()
+                    if data == "[DONE]":
+                        logger.debug("Received OpenRouter stream done marker")
+                        break
+
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        logger.debug("Skipping invalid OpenRouter stream JSON chunk: chunk=%s", data)
+                        continue
+
+                    logger.debug(
+                        "Received OpenRouter stream chunk: chunk=%s",
+                        json.dumps(safe_json(chunk, self.settings), ensure_ascii=False),
+                    )
+                    if isinstance(chunk, dict):
+                        images.extend(extract_images(chunk))
+        except httpx.TimeoutException as exc:
+            logger.exception(
+                "OpenRouter streaming image request timed out: endpoint=%s timeout_seconds=%s",
+                endpoint,
+                self.settings.openrouter_timeout_seconds,
+            )
+            raise OpenRouterError(
+                "OpenRouter streaming request timed out while waiting for image generation",
+                status_code=504,
+                details={"timeout_seconds": self.settings.openrouter_timeout_seconds},
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.exception(
+                "OpenRouter streaming image request failed before completion: endpoint=%s",
+                endpoint,
+            )
+            raise OpenRouterError(
+                "OpenRouter streaming request failed before completion",
+                status_code=502,
+                details=str(exc),
+            ) from exc
+
+        logger.debug("Collected images from OpenRouter stream: image_count=%s", len(images))
+        return images
 
     async def list_models(self, api_key: str) -> JsonObject:
         """Proxy OpenRouter model discovery using the caller's API key."""
@@ -242,14 +396,37 @@ class OpenRouterClient:
         timeout = httpx.Timeout(self.settings.openrouter_timeout_seconds)
 
         async with httpx.AsyncClient(timeout=timeout) as client:
+            logger.debug(
+                "Sending OpenRouter models request: endpoint=%s headers=%s params=%s",
+                endpoint,
+                json.dumps(safe_headers(headers, self.settings), ensure_ascii=False),
+                json.dumps(params, ensure_ascii=False),
+            )
             response = await client.get(endpoint, headers=headers, params=params)
+            response_payload = _safe_response_payload(response)
+            logger.debug(
+                "Received OpenRouter models response: status_code=%s response=%s",
+                response.status_code,
+                json.dumps(safe_json(response_payload, self.settings), ensure_ascii=False),
+            )
             if response.status_code >= 400:
+                logger.warning(
+                    "OpenRouter returned a models error response: status_code=%s response=%s",
+                    response.status_code,
+                    json.dumps(safe_json(response_payload, self.settings), ensure_ascii=False),
+                )
                 raise OpenRouterError(
                     "OpenRouter models request failed",
                     status_code=response.status_code,
-                    details=_safe_response_payload(response),
+                    details=response_payload,
                 )
-            return response.json()
+            if not isinstance(response_payload, dict):
+                raise OpenRouterError(
+                    "OpenRouter models response was not a JSON object",
+                    status_code=502,
+                    details=response_payload,
+                )
+            return response_payload
 
 
 def _safe_response_payload(response: httpx.Response) -> Any:
@@ -257,3 +434,11 @@ def _safe_response_payload(response: httpx.Response) -> Any:
         return response.json()
     except ValueError:
         return response.text
+
+
+def _parse_response_bytes(value: bytes) -> Any:
+    text = value.decode("utf-8", errors="replace")
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text

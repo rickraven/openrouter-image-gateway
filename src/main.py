@@ -1,3 +1,5 @@
+import json
+import logging
 import time
 from typing import Annotated
 
@@ -6,6 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .config import settings
+from .logging_utils import configure_logging, safe_headers, safe_json
 from .openrouter import OpenRouterClient, OpenRouterError
 from .schemas import (
     ImageData,
@@ -17,6 +20,9 @@ from .schemas import (
     OpenAIErrorResponse,
 )
 
+
+configure_logging(settings)
+logger = logging.getLogger("openrouter_image_gateway.main")
 
 app = FastAPI(
     title="OpenRouter Image Gateway",
@@ -61,11 +67,13 @@ async def get_openrouter_api_key(authorization: Annotated[str | None, Header()] 
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
+    logger.warning("Application returned HTTP error: status_code=%s detail=%s", exc.status_code, exc.detail)
     return openai_error(str(exc.detail), exc.status_code)
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    logger.warning("Request validation failed: errors=%s", exc.errors())
     return openai_error(str(exc), status.HTTP_422_UNPROCESSABLE_ENTITY, code="validation_error")
 
 
@@ -75,7 +83,50 @@ async def openrouter_exception_handler(_: Request, exc: OpenRouterError) -> JSON
     if exc.details:
         message = f"{message}: {exc.details}"
     error_type = "server_error" if exc.status_code >= 500 else "invalid_request_error"
+    logger.warning(
+        "Returning OpenRouter error to caller: status_code=%s type=%s message=%s",
+        exc.status_code,
+        error_type,
+        message,
+    )
     return openai_error(message, exc.status_code, error_type=error_type)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log incoming OpenAI-compatible requests at DEBUG level."""
+
+    if logger.isEnabledFor(logging.DEBUG):
+        body = await request.body()
+        parsed_body: object
+        if body:
+            try:
+                parsed_body = json.loads(body)
+                parsed_body = safe_json(parsed_body, settings)
+            except json.JSONDecodeError:
+                parsed_body = body.decode("utf-8", errors="replace")
+        else:
+            parsed_body = None
+
+        logger.debug(
+            "Incoming request: method=%s url=%s headers=%s body=%s",
+            request.method,
+            str(request.url),
+            json.dumps(safe_headers(dict(request.headers), settings), ensure_ascii=False),
+            json.dumps(parsed_body, ensure_ascii=False),
+        )
+
+    started_at = time.monotonic()
+    response = await call_next(request)
+    elapsed_ms = round((time.monotonic() - started_at) * 1000, 2)
+    logger.info(
+        "Completed request: method=%s path=%s status_code=%s elapsed_ms=%s",
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms,
+    )
+    return response
 
 
 @app.get("/")
@@ -122,4 +173,11 @@ async def generate_image(
         else:
             data.append(ImageData(b64_json=image.b64_json, revised_prompt=image.revised_prompt))
 
-    return ImageGenerationResponse(created=int(time.time()), data=data)
+    response = ImageGenerationResponse(created=int(time.time()), data=data)
+    logger.debug(
+        "Returning OpenAI image response: response_format=%s image_count=%s response=%s",
+        response_format,
+        len(data),
+        response.model_dump_json(),
+    )
+    return response
