@@ -1,0 +1,11 @@
+.git
+.code
+.cursor
+.env
+agent-transcripts
+node_modules
+dist
+__pycache__
+*.pyc
+test
+examples/data

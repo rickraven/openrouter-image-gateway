@@ -1,0 +1,23 @@
+services:
+  openrouter-image-gateway:
+    build:
+      context: .
+    image: openrouter-image-gateway:local
+    container_name: openrouter-image-gateway
+    environment:
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENROUTER_MODALITIES: ${OPENROUTER_MODALITIES:-image,text}
+      OPENROUTER_TIMEOUT_SECONDS: ${OPENROUTER_TIMEOUT_SECONDS:-120}
+      OPENROUTER_X_TITLE: ${OPENROUTER_X_TITLE:-openrouter-image-gateway}
+      OPENROUTER_HTTP_REFERER: ${OPENROUTER_HTTP_REFERER:-}
+      DEFAULT_RESPONSE_FORMAT: ${DEFAULT_RESPONSE_FORMAT:-b64_json}
+      MAX_IMAGES_PER_REQUEST: ${MAX_IMAGES_PER_REQUEST:-4}
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
